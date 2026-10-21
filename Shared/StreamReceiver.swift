@@ -69,6 +69,11 @@ final class StreamReceiver: ObservableObject {
     @Published var status = "Starting…"
     @Published var fps = 0
     @Published var connected = false
+    @Published private(set) var supportsKeyboardInput = false
+    @Published private(set) var supportsPencilToolInput = false
+    @Published private(set) var inputActionFeedback: String?
+    private var inputRequests: [String: Date] = [:] // main queue only
+    private var inputFeedbackGeneration: UInt64 = 0
     @Published var videoSize = CGSize.zero   // for touch coordinate mapping
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
@@ -704,6 +709,12 @@ final class StreamReceiver: ObservableObject {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         connection?.cancel()
         connection = conn
+        DispatchQueue.main.async {
+            self.supportsKeyboardInput = false
+            self.supportsPencilToolInput = false
+            self.inputRequests.removeAll()
+            self.inputActionFeedback = nil
+        }
         // The race is decided: rival candidates die here.
         for pending in pendingConnections where pending !== conn { pending.cancel() }
         pendingConnections.removeAll()
@@ -859,12 +870,24 @@ final class StreamReceiver: ObservableObject {
             // older than we support, it's the Mac that needs updating — and an
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
+            let inputCaps = hasUSBInputEndpoint(connection)
+                ? Set(obj["inputCaps"] as? [String] ?? []) : Set<String>()
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
+                self.supportsKeyboardInput = inputCaps.contains(RemoteInputProtocol.keyboardCapability)
+                self.supportsPencilToolInput = inputCaps.contains(RemoteInputProtocol.toolsCapability)
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
+            }
+        case RemoteInputProtocol.resultMessage:
+            guard let id = obj["id"] as? String,
+                  let ok = obj["ok"] as? Bool,
+                  let message = obj["message"] as? String, message.count <= 256 else { return }
+            DispatchQueue.main.async {
+                guard self.inputRequests.removeValue(forKey: id) != nil else { return }
+                self.setInputFeedback(ok ? nil : message)
             }
         case WireMessage.streamConfig:
             // H.264 remains implicit for old senders. New senders announce the
@@ -962,6 +985,7 @@ final class StreamReceiver: ObservableObject {
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
             "displayMaxFrameRate": displayMaxFrameRate,
+            "inputCaps": hasUSBInputEndpoint(conn) ? RemoteInputProtocol.capabilities : [],
         ]
         let panel = panelOverride ?? PanelAnnouncement(
             pixelsWide: devicePixelsWide, pixelsHigh: devicePixelsHigh, scale: deviceScale)
@@ -1099,6 +1123,61 @@ final class StreamReceiver: ObservableObject {
 
     func sendProximity(entering: Bool, x: Double, y: Double) {
         sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
+    }
+
+    /// Do not trust a remote welcome to turn on keyboard capture over Wi-Fi.
+    /// usbmux arrives at the iPad as a loopback peer; classify this socket,
+    /// not the mutable diagnostics label of another pending connection.
+    private func hasUSBInputEndpoint(_ conn: NWConnection?) -> Bool {
+        guard deviceKind != "Mac", let conn,
+              case let .hostPort(host, _) = conn.endpoint else { return false }
+        switch host {
+        case .ipv4(let address): return address == .loopback
+        case .ipv6(let address): return address == .loopback
+        case .name(let name, _): return name.lowercased() == "localhost"
+        @unknown default: return false
+        }
+    }
+
+    /// Physical keys only: the Mac input method owns composition and text.
+    func sendKey(usage: Int, phase: String, modifiers: Int, isRepeat: Bool = false) {
+        guard connected, supportsKeyboardInput, hasUSBInputEndpoint(connection),
+              let key = RemoteKeyEvent.parse(["usage": usage, "phase": phase,
+                                               "modifiers": modifiers, "repeat": isRepeat]) else { return }
+        sendControl(key.json)
+    }
+
+    func sendInputReset() {
+        // Called by the view lifecycle on main; deliberate cancellation is
+        // not a failed tool request five seconds later.
+        inputRequests.removeAll()
+        inputActionFeedback = nil
+        // An old peer ignores this additive message. Do not withhold key-up
+        // cleanup just because its welcome/availability is being cleared.
+        sendControl(["type": RemoteInputProtocol.resetMessage])
+    }
+
+    func sendToolAction(_ action: PencilToolAction) {
+        guard connected, supportsPencilToolInput, hasUSBInputEndpoint(connection) else { return }
+        let id = UUID().uuidString
+        inputRequests[id] = Date()
+        inputActionFeedback = nil
+        sendControl(["type": RemoteInputProtocol.toolMessage, "id": id, "action": action.rawValue])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.inputRequests.removeValue(forKey: id) != nil else { return }
+            self.setInputFeedback("工具切换未确认，请检查 Mac 上的 MarginNote 窗口。")
+        }
+    }
+
+    private func setInputFeedback(_ message: String?) {
+        inputFeedbackGeneration &+= 1
+        let generation = inputFeedbackGeneration
+        inputActionFeedback = message
+        guard message != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.inputFeedbackGeneration == generation else { return }
+            self.inputActionFeedback = nil
+        }
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
@@ -1590,6 +1669,10 @@ final class StreamReceiver: ObservableObject {
             self.connected = value
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+                self.supportsKeyboardInput = false
+                self.supportsPencilToolInput = false
+                self.inputRequests.removeAll()
+                self.inputActionFeedback = nil
             }
         }
         if !value { setStatus("Ready to connect") }

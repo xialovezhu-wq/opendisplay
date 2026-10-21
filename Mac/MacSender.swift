@@ -162,7 +162,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
-    private var inputInjector: InputInjector?
+    private let toolController = MarginNoteToolController()
+    private var inputInjector: InputInjector? {
+        willSet {
+            inputInjector?.resetInputs()
+            toolController.cancelPendingActions(canPerformAction: { [weak self] in
+                self?.inputInjector?.hasActiveStroke != true
+            })
+        }
+        didSet { queue.async { [weak self] in self?.discardToolRequests() } }
+    }
+    // Confined to the transport queue. Never replay commands on a new socket.
+    private var pendingToolRequests = MarginNoteToolRequestBuffer()
+    private var performingToolRequest: MarginNoteBoundToolRequest?
+    private var toolRequestEpoch: UInt64 = 0
+    private var seenToolRequests: [String] = []
+    private var keyboardInputLogged = false
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -1232,6 +1247,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
+        inputInjector?.resetInputs()
+        toolController.cancelPendingActions(canPerformAction: { [weak self] in
+            self?.inputInjector?.hasActiveStroke != true
+        })
+        queue.async { [weak self] in self?.clearRemoteInputSession() }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
         cursorImageTimer?.cancel()
@@ -1275,6 +1295,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, !self.stopped else { return }
             let label = if case .usb = newTransport { "USB" } else { "WiFi" }
             Log.info("switching \(self.endpointName) to \(label)")
+            self.clearRemoteInputSession()
             self.transport = newTransport
             // Fresh grace window: if the new link can't come up either, the
             // session ends like any other disconnect instead of dialing
@@ -1302,6 +1323,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Declare the device gone and end the session (must be called on `queue`).
     private func reportGone(_ reason: String) {
+        clearRemoteInputSession()
         guard !goneReported, !stopped else { return }
         goneReported = true
         Log.info(reason)
@@ -1315,6 +1337,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// other path (WiFi, routed Ethernet, the dev loopback) keeps the
     /// redial loop: a drop there is never intent.
     private func linkDied(_ detail: String) {
+        clearRemoteInputSession()
         if currentPathDirectLink, case .tcp = transport {
             reportGone("cable link lost (\(detail)) — unplugging means disconnect, ending session")
         } else {
@@ -1522,6 +1545,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
+        clearRemoteInputSession()
         Log.info("connection ready to \(endpointName)")
         connectionGeneration &+= 1
         let readyGeneration = connectionGeneration
@@ -1717,6 +1741,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// reconnect: the receiver parks the newcomer, adopts it on our first
     /// bytes, and the abandoned WiFi socket's EOF is ignored as stale.
     private func migrate(to conn: NWConnection) {
+        clearRemoteInputSession()
         let names = conn.currentPath?.availableInterfaces.map(\.name)
             .joined(separator: ",") ?? "?"
         Log.info("cable path answered (\(names)) — migrating the session off WiFi")
@@ -1904,6 +1929,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func scheduleReconnect() {
+        clearRemoteInputSession()
         guard !stopped else { return }
         if everConnected {
             if let since = disconnectedSince {
@@ -2238,8 +2264,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Control messages (phone -> Mac)
 
     private func receiveControl(on conn: NWConnection) {
+        let generation = connectionGeneration
         conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self, error == nil, let data, data.count == 4 else {
+            // Cancellation does not retract success callbacks already queued
+            // by Network. They must not inject old input into a new session.
+            guard let self, !self.stopped, self.connection === conn,
+                  self.connectionGeneration == generation else { return }
+            guard error == nil, let data, data.count == 4 else {
                 if let error {
                     Log.info("control receive ended: \(error)")
                     // A receive error on the live connection is fatal to it.
@@ -2249,7 +2280,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     // redial), not the link dying.
                     var isOwnCancel = false
                     if case .posix(let code) = error, code == .ECANCELED { isOwnCancel = true }
-                    if let self, self.connection === conn, !isOwnCancel {
+                    if !isOwnCancel {
                         self.linkDied("receive failed: \(error)")
                     }
                 }
@@ -2258,7 +2289,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
             guard len > 0, len < 1 << 20 else { return }
             conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
-                guard let self, error == nil, let payload, payload.count == len else { return }
+                guard let self, !self.stopped, self.connection === conn,
+                      self.connectionGeneration == generation,
+                      error == nil, let payload, payload.count == len else { return }
                 self.handleControl(payload)
                 self.receiveControl(on: conn)
             }
@@ -2359,11 +2392,71 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+        case RemoteInputProtocol.keyMessage:
+            guard acceptsRemoteInput(RemoteInputProtocol.keyboardCapability),
+                  let key = RemoteKeyEvent.parse(obj), let inputInjector else { return }
+            if inputInjector.handleKey(key), !keyboardInputLogged {
+                keyboardInputLogged = true
+                Log.info("negotiated USB keyboard input active")
+            }
+        case RemoteInputProtocol.resetMessage:
+            guard acceptsRemoteInput(RemoteInputProtocol.keyboardCapability)
+                    || acceptsAnyToolInput() else { return }
+            inputInjector?.resetInputs()
+            restoreAndCancelToolRequests()
+        case RemoteInputProtocol.toolMessage:
+            guard let request = PencilToolRequest.parse(obj), acceptsToolInput(request.action) else { return }
+            guard !seenToolRequests.contains(request.id) else { return }
+            seenToolRequests.append(request.id)
+            if seenToolRequests.count > 128 { seenToolRequests.removeFirst() }
+            // Bind before either the stroke wait or the controller's AX queue.
+            // This WindowServer snapshot performs no cross-process AX calls.
+            var temporaryTarget = pendingToolRequests.projectedTemporaryTarget(
+                active: toolController.activeTemporaryTarget, inFlight: performingToolRequest)
+            if request.action == .endTemporaryLasso, temporaryTarget == nil {
+                // A duplicate release waits behind an outstanding restoration
+                // rather than claiming it already succeeded.
+                temporaryTarget = pendingToolRequests.pending.last(where: {
+                    $0.request.action == .endTemporaryLasso
+                })?.target ?? (performingToolRequest?.request.action == .endTemporaryLasso
+                              ? performingToolRequest?.target : nil) ?? toolController.activeTemporaryTarget
+            }
+            if request.action == .endTemporaryLasso, temporaryTarget == nil {
+                sendInputResult(request, ok: true, message: "临时套索已结束。")
+                return
+            }
+            let target = request.action.requiresTemporaryToolsCapability
+                ? temporaryTarget ?? toolController.captureTarget() : toolController.captureTarget()
+            guard let target else {
+                sendInputResult(request, ok: false, message: "请先点选 iPad 上的 MarginNote 4 窗口，再使用笔身手势。")
+                return
+            }
+            let bound = MarginNoteBoundToolRequest(request: request, target: target)
+            guard pendingToolRequests.append(bound) else {
+                if request.action == .endTemporaryLasso {
+                    // Release must survive overload: cancel obsolete queued
+                    // begins, then restore whatever actually reached the app.
+                    restoreAndCancelToolRequests(completing: request)
+                } else {
+                    sendInputResult(request, ok: false, message: "手势操作过于频繁，请等待当前切换完成。")
+                }
+                return
+            }
+            if request.action != .endTemporaryLasso {
+                queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, let expired = self.pendingToolRequests.expire(request.id) else { return }
+                    self.sendInputResult(expired.request, ok: false, message: "等待工具切换超时，请抬笔后再试。")
+                    self.drainPendingToolRequest()
+                }
+            }
+            drainPendingToolRequest()
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
                 inputInjector?.handleTouch(phase: phase, x: x, y: y)
+                if phase == "ended" { drainPendingToolRequest() }
+                else if phase == "cancelled" { cancelPendingToolRequests() }
                 if let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
@@ -2380,12 +2473,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
+                let hadActiveStroke = inputInjector?.hasActiveStroke == true
                 inputInjector?.handlePencil(
                     phase: phase, x: x, y: y,
                     pressure: obj["pressure"] as? Double ?? 0,
                     azimuth: obj["azimuth"] as? Double ?? 0,
                     altitude: obj["altitude"] as? Double ?? (.pi / 2),
                     rotation: obj["rotation"] as? Double ?? 0)
+                if phase == "up" { drainPendingToolRequest() }
+                else if phase == "cancel" || phase == "cancelled" || phase == "hover" && hadActiveStroke {
+                    // Hover can repair a missing pen-up; it does not establish
+                    // that a queued gesture's interrupted stroke completed.
+                    cancelPendingToolRequests()
+                }
                 if let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
@@ -2406,6 +2506,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("phone requested keyframe")
             needsKeyframe = true
         case WireMessage.sleeping:
+            clearRemoteInputSession()
             // The device locked and is about to close on us. Hand the
             // session to the controller right away: it tears the virtual
             // display down (returning the cursor to a visible screen) and
@@ -2413,6 +2514,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("receiver went to sleep — ending session, reconnect armed for wake")
             Task { @MainActor in self.onPeerSleeping?() }
         case WireMessage.closing:
+            clearRemoteInputSession()
             // The app on the device is quitting for real — end the session
             // without the silence grace and without waiting for a wake.
             Log.info("receiver app closed — ending session")
@@ -2945,7 +3047,113 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        let caps: [String]
+        if case .usb = transport { caps = RemoteInputProtocol.capabilities }
+        else { caps = [] } // No silent Wi-Fi input bridge for this build.
+        let welcome: [String: Any] = ["type": WireMessage.welcome,
+            "pv": WireProtocol.version, "min": WireProtocol.minSupportedPeer, "inputCaps": caps]
+        if let data = try? JSONSerialization.data(withJSONObject: welcome),
+           let text = String(data: data, encoding: .utf8) { sendJSONFrame(text) }
+    }
+
+    private func acceptsRemoteInput(_ capability: String) -> Bool {
+        guard !stopped, connectionReady, helloSeenOnConnection,
+              case .usb = transport else { return false }
+        return lastHello?.inputCaps?.contains(capability) == true
+    }
+
+    private func acceptsAnyToolInput() -> Bool {
+        acceptsRemoteInput(RemoteInputProtocol.toolsCapability)
+            || acceptsRemoteInput(RemoteInputProtocol.legacyToolsCapability)
+    }
+
+    private func acceptsToolInput(_ action: PencilToolAction) -> Bool {
+        action.requiresTemporaryToolsCapability
+            ? acceptsRemoteInput(RemoteInputProtocol.toolsCapability) : acceptsAnyToolInput()
+    }
+
+    private func clearRemoteInputSession() {
+        inputInjector?.resetInputs()
+        restoreAndCancelToolRequests()
+        seenToolRequests.removeAll()
+        keyboardInputLogged = false
+    }
+
+    private func drainPendingToolRequest() {
+        guard performingToolRequest == nil, inputInjector?.hasActiveStroke == false,
+              let request = pendingToolRequests.popFirst() else { return }
+        performToolRequest(request)
+    }
+
+    private func cancelPendingToolRequests() {
+        restoreAndCancelToolRequests(message: "触摸已取消，已取消排队手势并尝试恢复先前工具。")
+    }
+
+    private func discardToolRequests(message: String? = nil) {
+        toolRequestEpoch &+= 1
+        let pending = pendingToolRequests.removeAll()
+        let inFlight = performingToolRequest
+        performingToolRequest = nil
+        if let message, connectionReady, helloSeenOnConnection, !stopped {
+            for item in pending + (inFlight.map { [$0] } ?? []) {
+                sendInputResult(item.request, ok: false, message: message)
+            }
+        }
+    }
+
+    private func restoreAndCancelToolRequests(message: String? = nil,
+                                              completing request: PencilToolRequest? = nil) {
+        discardToolRequests(message: message ?? (request == nil ? nil : "已取消过量排队手势，正在恢复先前工具。"))
+        let epoch = toolRequestEpoch
+        let generation = connectionGeneration
+        let conn = connection
+        toolController.cancelPendingActions(canPerformAction: { [weak self] in
+            self?.inputInjector?.hasActiveStroke != true
+        }) { [weak self] ok, message in
+            guard let self else { return }
+            self.queue.async {
+                guard self.toolRequestEpoch == epoch else { return }
+                if let request, !self.stopped, self.connection === conn,
+                   self.connectionGeneration == generation {
+                    self.sendInputResult(request, ok: ok, message: message)
+                }
+                self.drainPendingToolRequest()
+            }
+        }
+    }
+
+    private func performToolRequest(_ bound: MarginNoteBoundToolRequest) {
+        let request = bound.request
+        guard acceptsToolInput(request.action),
+              let display = virtualDisplay, let conn = connection, let injector = inputInjector else {
+            sendInputResult(request, ok: false, message: "请连接 USB 并使用扩展显示模式。")
+            drainPendingToolRequest()
+            return
+        }
+        performingToolRequest = bound
+        let generation = connectionGeneration
+        let epoch = toolRequestEpoch
+        toolController.perform(request.action, target: bound.target, for: display.displayID,
+            canPerformAction: { [weak injector] in injector?.hasActiveStroke == false }) { [weak self] ok, message in
+            guard let self else { return }
+            self.queue.async {
+                guard self.toolRequestEpoch == epoch,
+                      self.performingToolRequest?.request.id == request.id else { return }
+                self.performingToolRequest = nil
+                guard !self.stopped, self.connection === conn,
+                      self.connectionGeneration == generation else { return }
+                self.sendInputResult(request, ok: ok, message: message)
+                self.drainPendingToolRequest()
+            }
+        }
+    }
+
+    private func sendInputResult(_ request: PencilToolRequest, ok: Bool, message: String) {
+        let result: [String: Any] = ["type": RemoteInputProtocol.resultMessage,
+            "id": request.id, "ok": ok, "message": String(message.prefix(256))]
+        if let data = try? JSONSerialization.data(withJSONObject: result),
+           let text = String(data: data, encoding: .utf8) { sendJSONFrame(text) }
+        Log.info("Pencil tool \(request.action.rawValue): \(ok ? "confirmed" : "not applied") — \(message)")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

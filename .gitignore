@@ -27,6 +27,14 @@ newnewicon.png
 .env
 .claude/
 
+# Local Python caches and Apple signing material are not source deliverables.
+__pycache__/
+*.py[cod]
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+
 # Fastlane generated output
 fastlane/report.xml
 fastlane/Preview.html

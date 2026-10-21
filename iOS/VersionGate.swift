@@ -53,6 +53,9 @@ final class VersionGate: ObservableObject {
     }
 
     func check() async {
+        #if DEBUG
+        return // Paired local build; the public App Store build is not an upgrade.
+        #else
         let current = currentVersion
         guard current != "0.0.0" else { return }   // dev build — never gate
 
@@ -76,6 +79,7 @@ final class VersionGate: ObservableObject {
             remoteStatus = .ok
         }
         recompute()
+        #endif
     }
 
     /// Fold in what the connected Mac told us. `updateReceiver` is a hard gate

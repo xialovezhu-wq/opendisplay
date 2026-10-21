@@ -42,8 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // run; the menu item drives manual "Check for Updates…". Held for the
     // app's lifetime here so every window (menu bar + control window) shares
     // one updater instance.
+    #if DEBUG
+    // This paired development build must not auto-replace itself with the
+    // public release, which does not understand its input extension.
+    let updater = SPUStandardUpdaterController(
+        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    #else
     let updater = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hand the updater to the control window, which is built outside the
@@ -215,7 +222,7 @@ final class SenderController: ObservableObject {
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
-    @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    @Published var port = UserDefaults.standard.string(forKey: "port") ?? String(RemoteInputProtocol.receiverPort)
     // `-mode mirror` / `-mode extend` launch argument also works.
     @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
@@ -1068,9 +1075,11 @@ struct ContentView: View {
                 Button("Logs") { Log.revealInFinder() }
                     .controlSize(.small)
                     .help("Reveal the OpenDisplay log files in Finder")
-                if let updater {
-                    CheckForUpdatesView(updater: updater)
-                }
+                #if DEBUG
+                Text("Input development build").font(.caption).foregroundStyle(.secondary)
+                #else
+                if let updater { CheckForUpdatesView(updater: updater) }
+                #endif
                 Button("Quit") { NSApp.terminate(nil) }
                     .controlSize(.small)
             }

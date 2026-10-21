@@ -1,3 +1,15 @@
+# Personal OpenDisplay development variant
+
+This repository preserves the upstream v1.25.0 history and GPL-3.0 license and
+adds paired USB keyboard input, Pencil tool gestures for MarginNote 4,
+finger tap/scroll interaction, and local development-signature renewal tools.
+It is a personal development variant, not an official OpenDisplay release.
+
+See [local build and behavior notes](LOCAL_INPUT_BUILD.md) and
+[iPad input details](iOS/REMOTE_INPUT.md). Signing credentials, device identifiers,
+installed applications, and machine-specific renewal configuration are not stored
+in this repository. The original upstream overview follows.
+
 <div align="center">
 
 <img src="public/logo.png" width="128" alt="OpenDisplay app icon" />

@@ -855,3 +855,54 @@ This file is versioned by git; the authoritative change log is
 | 2026-08-26 | Additive: `hello.cursorPort` and the UDP cursor side channel (section 6.3) |
 | 2026-09-30 | Additive: `hello.power` and `power`, direct cable only (section 6.6) |
 | 2026-10-01 | Additive: `hello.panel`, the sender decides the desktop (section 6.7); limits are in the current orientation (6.5); `pixelsWide/High/scale` deprecated |
+
+## Local input extension (development build)
+
+This local fork adds optional, namespaced input capabilities. The public wire
+version and legacy touch/video paths remain unchanged. Both `hello` and `welcome`
+carry `inputCaps`; absence means no new input. This build offers/enables the
+extension only on the paired iPad USB/usbmux connection, verified independently
+at each end. A network/legacy peer never implicitly enables keyboard capture.
+
+- `study.keyboard-hid.v2`: `studyKey` messages with integer physical key `usage`,
+  `phase` (`down` / `up`), `modifiers` (Shift=1, Control=2, Option=4, Command=8,
+  Caps Lock=16, Function=32), and boolean `repeat`. In addition to the original
+  keyboard HID range, v2 explicitly accepts 0x29D: the Globe value observed via
+  public UIKey callbacks on the paired M4 Magic Keyboard/iPadOS 27. It maps to
+  the Mac Function key and secondary-Fn flag. Other out-of-range codes remain
+  rejected. No private HID API is used or general support for all vendor keys
+  inferred. The Mac owns its input method; no composed Unicode is injected
+  alongside physical keys. Left/right modifier flags are preserved so global
+  modifier-only shortcuts can recognize physical-style Command transitions.
+- `studyInputReset`: release only this session's keys and active pointer stroke.
+  Sent on receiver focus/background/teardown; the sender also resets locally on
+  disconnect, replacement, transport migration, or stop, so delivery is not
+  required for cleanup. Cancel obsolete tool requests and make one guarded
+  attempt to restore a temporary lasso's original tool in its original window.
+- `study.pencil-tools.v1`: `studyTool` with UUID `id` and `action` equal to
+  `toggleEraser` or `selectLasso`. Retained for paired builds using the original
+  persistent-lasso behavior.
+- `study.pencil-tools.v2`: additionally accepts `beginTemporaryLasso` and
+  `endTemporaryLasso`. Begin saves the selected tool once (eraser included),
+  then selects lasso. End restores that exact tool; it does not substitute the
+  default pen. Repeated begin never overwrites the saved tool, and repeated end
+  is a no-op after restoration. New hold/release clients require v2 explicitly.
+  All tool requests use a bounded FIFO, are deduplicated per connection, and
+  are never replayed into a replacement session. End is bound to the initiating
+  window even if focus changes; ordinary actions wait until pen-up for at most
+  three seconds, while end remains queued through a long active stroke. If the
+  queue is full when end arrives, cancel obsolete work and safely restore the
+  tool that actually reached the app. An end cannot be silently discarded.
+- `studyInputResult`: the sender replies with the request `id`, boolean `ok`,
+  and a short `message`. Success means MarginNote's selected tool was read back;
+  a repeated end with no temporary state is an explicit successful no-op.
+  A sent click alone is not success. Failures appear briefly without blocking
+  touches or adding a sidebar.
+
+The Mac adapter acts only on the current MarginNote 4 window on the target
+extended display. Missing/ambiguous tools, changed focus, a new stroke, loss of
+permission, or cancelled connections stop the action. Cleanup restoration uses
+the same window/display/idle checks and is never retried automatically after a
+failed safety check. iPadOS-reserved shortcuts
+and Pencil system actions (such as squeeze configured as Run Shortcut) remain
+subject to the operating system; they are not claimed as universally forwarded.

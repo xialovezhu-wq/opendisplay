@@ -19,6 +19,7 @@ struct PhoneInfo: Decodable {
     let maxEncodeHigh: Int?  //  6.5): caps the stream, and with it the desktop
     let displayMaxFrameRate: Int?       // presentation ceiling; absent = legacy 60
     let videoCaps: [VideoCapability]?   // codec-specific joint decode constraints
+    let inputCaps: [String]? // optional negotiated physical keyboard / Pencil tool extensions
     let power: [String]?  // power actions the receiver accepts on THIS session
                           // (PROTOCOL.md 6.6); absent = none offered
     let panel: PanelInfo? // the receiver's panel facts (PROTOCOL.md 6.7);

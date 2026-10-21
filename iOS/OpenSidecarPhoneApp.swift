@@ -75,9 +75,25 @@ struct ReceiverScreen: View {
                     Color.black.ignoresSafeArea()
                     VideoLayerView(displayLayer: model.receiver.displayLayer,
                                    receiver: model.receiver,
-                                   useMetal: metalRenderer)
+                                   useMetal: metalRenderer,
+                                   remoteInputEnabled: scenePhase == .active && !showSettings
+                                       && !showOnboarding && requiredUpdate == nil
+                                       && recommendedUpdate == nil)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
+                    if let message = model.receiver.inputActionFeedback {
+                        VStack {
+                            Text(message)
+                                .font(.caption)
+                                .multilineTextAlignment(.center)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                                .padding(.horizontal, 24)
+                            Spacer()
+                        }
+                        .padding(.top, 16)
+                        .allowsHitTesting(false)
+                    }
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -364,7 +380,7 @@ struct SettingsView: View {
                 }
 
                 Section("Status") {
-                    LabeledRow("Listening", value: "Port 9000")
+                    LabeledRow("Listening", value: "Port \(RemoteInputProtocol.receiverPort)")
                     LabeledRow("Connection",
                                value: receiver.connected ? "Connected" : "Waiting for a computer")
                     if receiver.videoSize != .zero {
@@ -393,6 +409,17 @@ struct SettingsView: View {
                     Text("Analytics")
                 } footer: {
                     Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
+                }
+
+                Section {
+                    LabeledRow("iPad keyboard", value: receiver.connected && receiver.supportsKeyboardInput
+                               ? "Ready" : "Needs a compatible Mac app")
+                    LabeledRow("Pencil gestures", value: receiver.connected && receiver.supportsPencilToolInput
+                               ? "Ready" : "Needs a compatible Mac app")
+                    Text("Double-tap: pen / eraser. Hold Pencil Pro squeeze for lasso; release to restore the previous tool. In Apple Pencil settings, choose a tool action for Squeeze.")
+                    Text("Type with your iPad's physical keyboard; choose the language and input method on the Mac. Some iPadOS system shortcuts stay on the iPad.")
+                } header: {
+                    Text("Keyboard & Pencil")
                 }
 
                 Section {
@@ -544,6 +571,7 @@ final class ReceiverModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     init() {
+        InstallationReceipt.write()
         // Offer HEVC wherever the hardware decodes it (A9 and later; the A8/A8X
         // iPads stay on H.264). Panels here fit H.264's raster anyway, so HEVC
         // buys quality per bit, which matters most over WiFi. Bounded by the
@@ -584,7 +612,7 @@ final class ReceiverModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
-        receiver.start(port: 9000)
+        receiver.start(port: RemoteInputProtocol.receiverPort)
     }
 
     // MARK: - Lock vs app switch vs app quit
@@ -695,12 +723,14 @@ struct VideoLayerView: UIViewRepresentable {
     let displayLayer: AVSampleBufferDisplayLayer
     let receiver: StreamReceiver
     let useMetal: Bool
+    let remoteInputEnabled: Bool
 
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
         view.backgroundColor = .black
         view.isMultipleTouchEnabled = true
         view.receiver = receiver
+        view.remoteInputEnabled = remoteInputEnabled
 
         Log.info("video view: metal=\(useMetal)")
         if useMetal, let renderer = MetalVideoRenderer() {
@@ -733,6 +763,9 @@ struct VideoLayerView: UIViewRepresentable {
         let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
+        // Trackpad two-finger scroll and mouse wheels arrive as scroll input,
+        // not as two touches on the glass. Opt in to the public scroll path.
+        pan.allowedScrollTypesMask = .all
         view.addGestureRecognizer(pan)
 
         // Local cursor echo: position updates ride the ~2ms control path
@@ -755,14 +788,29 @@ struct VideoLayerView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: VideoView, context: Context) {
+        uiView.remoteInputEnabled = remoteInputEnabled
+        uiView.synchronizeRemoteInput()
         // videoSize arrives after the format description — re-fit the layers.
         uiView.setNeedsLayout()
     }
 
-    final class VideoView: UIView {
-        weak var receiver: StreamReceiver?
+    static func dismantleUIView(_ uiView: VideoView, coordinator: ()) {
+        uiView.releaseRemoteInput()
+        uiView.remoteInputEnabled = false
+        uiView.synchronizeRemoteInput()
+    }
+
+    final class VideoView: RemoteInputView {
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
+        private var directTouch = DirectTouchState()
+
+        override func remoteInputWillReset() {
+            discardPendingDown()
+            directTouch.reset()
+            twoFingerActive = false
+            inputEngine.resetLocalState()
+        }
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -861,12 +909,7 @@ struct VideoLayerView: UIViewRepresentable {
             return (min(max(x, 0), 1), min(max(y, 0), 1))
         }
 
-        private func isFinger(_ touch: UITouch) -> Bool {
-            switch touch.type {
-            case .direct, .indirectPointer: return true
-            default: return false
-            }
-        }
+        private func isPointer(_ touch: UITouch) -> Bool { touch.type == .indirectPointer }
 
         private func isPencil(_ touch: UITouch) -> Bool {
             touch.type == .pencil
@@ -880,8 +923,14 @@ struct VideoLayerView: UIViewRepresentable {
             guard let video = receiver?.videoSize, video != .zero else { return }
             switch recognizer.state {
             case .began:
+                directTouch.reset()
+                if downSent {
+                    receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
+                }
+                discardPendingDown()
                 twoFingerActive = true
                 lastPan = .zero
+                Log.info("Scroll gesture began: contacts=\(recognizer.numberOfTouches)")
                 // macOS delivers scroll to whatever sits under the cursor, and
                 // the cursor no longer follows the fingers now that a press is
                 // withheld until it commits. Put it on the gesture once, up
@@ -892,15 +941,72 @@ struct VideoLayerView: UIViewRepresentable {
                     lastNorm = n
                     receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
                 }
+                sendPanDelta(recognizer, video: video)
             case .changed:
-                let t = recognizer.translation(in: self)
-                let scale = min(bounds.width / video.width, bounds.height / video.height)
-                // Deltas in video pixels, natural-scrolling direction.
-                receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
-                                     dy: (t.y - lastPan.y) / scale)
-                lastPan = t
+                sendPanDelta(recognizer, video: video)
+            case .ended:
+                sendPanDelta(recognizer, video: video)
+                twoFingerActive = false
             default:
                 twoFingerActive = false
+            }
+        }
+
+        private func sendPanDelta(_ recognizer: UIPanGestureRecognizer, video: CGSize) {
+            let t = recognizer.translation(in: self)
+            let scale = min(bounds.width / video.width, bounds.height / video.height)
+            guard scale > 0 else { return }
+            let dx = (t.x - lastPan.x) / scale
+            let dy = (t.y - lastPan.y) / scale
+            lastPan = t
+            guard dx != 0 || dy != 0 else { return }
+            // Deltas in video pixels, including the first/last scroll samples.
+            receiver?.sendScroll(dx: dx, dy: dy)
+        }
+
+        /// Direct fingers use tap/scroll semantics. A scrolling finger never
+        /// posts a mouse-down, so the Mac cannot interpret it as text selection.
+        private func sendDirectTouch(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            let activeFingers = event?.allTouches?.filter {
+                $0.type == .direct && $0.phase != .ended && $0.phase != .cancelled
+            }.count ?? touches.count
+            guard !twoFingerActive, activeFingers <= 1, !inputEngine.hasActivePen else {
+                directTouch.reset()
+                return
+            }
+            for touch in touches {
+                let id = ObjectIdentifier(touch).hashValue
+                let point = touch.location(in: self)
+                let actions: [DirectTouchState.Action]
+                switch phase {
+                case "began": actions = directTouch.began(id: id, point: point)
+                case "moved": actions = directTouch.moved(id: id, point: point)
+                case "ended": actions = directTouch.ended(id: id, point: point)
+                case "cancelled": actions = directTouch.cancel(id: id)
+                default: actions = []
+                }
+                for action in actions { emitDirectTouch(action) }
+            }
+        }
+
+        private func emitDirectTouch(_ action: DirectTouchState.Action) {
+            switch action {
+            case .beginScroll(let anchor):
+                guard let n = normalized(anchor) else { return }
+                lastNorm = n
+                receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                Log.info("Direct finger scroll began")
+            case .scroll(let delta):
+                guard let video = receiver?.videoSize, video != .zero else { return }
+                let scale = min(bounds.width / video.width, bounds.height / video.height)
+                guard scale > 0 else { return }
+                receiver?.sendScroll(dx: delta.x / scale, dy: delta.y / scale)
+            case .click(let point):
+                guard let n = normalized(point) else { return }
+                lastNorm = n
+                receiver?.sendTouch(phase: "began", x: n.x, y: n.y)
+                receiver?.sendTouch(phase: "ended", x: n.x, y: n.y)
+                Log.info("Direct finger tap completed")
             }
         }
 
@@ -941,19 +1047,19 @@ struct VideoLayerView: UIViewRepresentable {
             holdTimer = nil
         }
 
-        private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
-            let fingers = touches.filter { isFinger($0) }
-            guard !fingers.isEmpty else { return }
+        private func sendPointer(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            let pointers = touches.filter { isPointer($0) }
+            guard !pointers.isEmpty else { return }
             // Ignore single-finger events while a two-finger gesture runs,
             // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.filter { isFinger($0) }.count ?? 1) > 1 {
+            if twoFingerActive || (event?.allTouches?.filter { isPointer($0) }.count ?? 1) > 1 {
                 if downSent {
                     receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
                 }
                 discardPendingDown()
                 return
             }
-            guard let touch = fingers.first,
+            guard let touch = pointers.first,
                   let norm = normalized(touch.location(in: self)) else { return }
             lastNorm = norm
 
@@ -1036,33 +1142,44 @@ struct VideoLayerView: UIViewRepresentable {
 
         private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
             let pencil = touches.filter { isPencil($0) }
-            let finger = touches.filter { isFinger($0) }
+            let direct = touches.filter { $0.type == .direct }
+            let pointers = touches.filter { isPointer($0) }
             let usePencilWire = receiver?.macSupportsPencilWire ?? false
 
             if !pencil.isEmpty {
+                // A resting palm must never become a delayed tap after pen-up.
+                directTouch.reset()
                 if usePencilWire {
-                    inputEngine.handle(pencil, event: event, ended: ended)
+                    inputEngine.handle(pencil, event: event, ended: ended, cancelled: phase == "cancelled")
                 } else {
                     sendPencilAsTouch(phase, pencil, event)
                 }
             }
-            // Palm rejection: ignore resting fingers while the pen is down.
-            if !finger.isEmpty && !inputEngine.hasActivePen {
-                send(phase, finger, event)
+            if !direct.isEmpty && pencil.isEmpty {
+                sendDirectTouch(phase, direct, event)
+            }
+            // Keep physical mouse/trackpad clicking and dragging unchanged.
+            if !pointers.isEmpty && !inputEngine.hasActivePen {
+                sendPointer(phase, pointers, event)
             }
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            focusRemoteInput()
+            pencilContactsBegan(touches)
             routeTouches("began", touches, event, ended: false)
         }
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            pencilContactsBegan(touches)
             routeTouches("moved", touches, event, ended: false)
         }
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
             routeTouches("ended", touches, event, ended: true)
+            pencilContactsEnded(touches, cancelled: false)
         }
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
             routeTouches("cancelled", touches, event, ended: true)
+            pencilContactsEnded(touches, cancelled: true)
         }
     }
 }
@@ -1088,6 +1205,13 @@ final class InputCaptureEngine: NSObject {
     private weak var hostView: UIView?
     private var activePens: Set<UInt64> = []
     private var proximityActive = false
+
+    /// The negotiated input-reset message releases any corresponding Mac
+    /// button/proximity. Do not retain a local down across that boundary.
+    func resetLocalState() {
+        activePens.removeAll()
+        proximityActive = false
+    }
 
     func install(on view: UIView) {
         hostView = view
@@ -1123,10 +1247,10 @@ final class InputCaptureEngine: NSObject {
         }
     }
 
-    func handle(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool) {
+    func handle(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool, cancelled: Bool = false) {
         guard hostView != nil else { return }
         for touch in touches where touch.type == .pencil {
-            emitPen(touch, event: event, ended: ended)
+            emitPen(touch, event: event, ended: ended, cancelled: cancelled)
         }
     }
 
@@ -1142,7 +1266,7 @@ final class InputCaptureEngine: NSObject {
         onProximity?(false, x, y)
     }
 
-    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool) {
+    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool, cancelled: Bool) {
         guard let view = hostView else { return }
         let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
         let loc = touch.location(in: view)
@@ -1173,7 +1297,7 @@ final class InputCaptureEngine: NSObject {
         }
 
         defer { activePens.remove(id) }
-        emitPencil("up", x: nx, y: ny, pressure: 0,
+        emitPencil(cancelled ? "cancelled" : "up", x: nx, y: ny, pressure: 0,
                    azimuth: azimuth, altitude: altitude)
         closeProximity(x: nx, y: ny)
     }
