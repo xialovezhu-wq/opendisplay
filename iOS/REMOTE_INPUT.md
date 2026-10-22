@@ -110,3 +110,23 @@ Run `sh tools/tests/direct-touch-state/run.sh` for the direct-touch state checks
 The local iPad build 184 was compiled, signed, installed and read back. The user
 confirmed tap, single-finger scrolling without text selection, mouse text dragging
 and Pencil handwriting on the device.
+
+## Finger scroll momentum
+
+`FingerScrollMomentum` samples actual touch positions/timestamps over the latest
+100 ms. Only a completed direct scroll may start a tail. Release after an 80 ms
+pause, a tap, cancellation, or multiple fingers does not fling. Starting velocity
+is bounded; analytic exponential integration keeps total travel consistent
+across frame rates. This approximates the interaction of native scrolling, not
+an assertion of identical UIKit physics.
+
+The view uses a weak-target CADisplayLink at 60 Hz only while coasting. Sub-point
+deltas accumulate before sending wheel updates, including the final partial
+step. A new touch brakes immediately; a stationary braking tap does not click
+the underlying control, while a fresh swipe still works. Pencil/pointer input,
+keyboard presses, two-finger trackpad scroll, host-cursor movement, view changes,
+background and session reset also stop momentum. A stalled display callback
+cannot cause a large catch-up jump.
+
+Run `sh tools/tests/finger-scroll-momentum/run.sh` for the momentum checks;
+`sh tools/tests/direct-touch-state/run.sh` verifies tap/scroll separation.

@@ -25,6 +25,10 @@ This is a paired development build, not an official OpenDisplay release.
   a cancelled or multi-finger contact cannot emit a leftover click.
 - Physical mouse/trackpad pointer dragging and Pencil handwriting retain their
   separate paths, with no new sidebar.
+- Fast finger swipes continue after release with a bounded, decelerating tail.
+  Touching again stops it without activating the item under that braking tap.
+  A paused/slow release does not fling; new input, background, disconnect,
+  viewport changes and host-cursor movement cancel the tail.
 
 ## Build and installation
 

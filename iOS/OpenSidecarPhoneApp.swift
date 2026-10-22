@@ -804,8 +804,41 @@ struct VideoLayerView: UIViewRepresentable {
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
         private var directTouch = DirectTouchState()
+        private var fingerMomentum = FingerScrollMomentum()
+        private var momentumDisplayLink: CADisplayLink?
+        private var momentumLastFrame: CFTimeInterval = 0
+        private var momentumRemainder = CGPoint.zero
+        private var momentumViewport = CGSize.zero
+        private var momentumVideoSize = CGSize.zero
+        private var suppressMomentumBrakeTap = false
+
+        /// CADisplayLink retains its target. Keep only a weak reference back to
+        /// the view so disconnecting/replacing the video view cannot leak it.
+        @MainActor
+        private final class MomentumTickTarget: NSObject {
+            weak var view: VideoView?
+            init(view: VideoView) { self.view = view }
+            @objc func tick(_ link: CADisplayLink) {
+                guard let view else { link.invalidate(); return }
+                view.advanceFingerMomentum()
+            }
+        }
+
+        deinit { momentumDisplayLink?.invalidate() }
+
+        override func willMove(toWindow newWindow: UIWindow?) {
+            if newWindow == nil { stopFingerMomentum() }
+            super.willMove(toWindow: newWindow)
+        }
+
+        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            stopFingerMomentum()
+            super.pressesBegan(presses, with: event)
+        }
 
         override func remoteInputWillReset() {
+            stopFingerMomentum()
+            suppressMomentumBrakeTap = false
             discardPendingDown()
             directTouch.reset()
             twoFingerActive = false
@@ -830,6 +863,9 @@ struct VideoLayerView: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            if momentumDisplayLink != nil && bounds.size != momentumViewport {
+                stopFingerMomentum()
+            }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             if let renderer = metalRenderer {
@@ -866,6 +902,13 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         func moveCursor(x: Double, y: Double, visible: Bool) {
+            // A mouse/Pencil moving the host cursor must not redirect an old
+            // inertial tail into the new pane or another display.
+            if fingerMomentum.isActive,
+               !visible || hypot((x - lastNorm.x) * bounds.width,
+                                  (y - lastNorm.y) * bounds.height) > 6 {
+                stopFingerMomentum()
+            }
             cursorNorm = CGPoint(x: x, y: y)
             cursorVisible = visible
             CATransaction.begin()
@@ -923,6 +966,8 @@ struct VideoLayerView: UIViewRepresentable {
             guard let video = receiver?.videoSize, video != .zero else { return }
             switch recognizer.state {
             case .began:
+                stopFingerMomentum()
+                suppressMomentumBrakeTap = false
                 directTouch.reset()
                 if downSent {
                     receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
@@ -971,6 +1016,8 @@ struct VideoLayerView: UIViewRepresentable {
                 $0.type == .direct && $0.phase != .ended && $0.phase != .cancelled
             }.count ?? touches.count
             guard !twoFingerActive, activeFingers <= 1, !inputEngine.hasActivePen else {
+                stopFingerMomentum()
+                suppressMomentumBrakeTap = false
                 directTouch.reset()
                 return
             }
@@ -978,15 +1025,94 @@ struct VideoLayerView: UIViewRepresentable {
                 let id = ObjectIdentifier(touch).hashValue
                 let point = touch.location(in: self)
                 let actions: [DirectTouchState.Action]
+                var shouldStartMomentum = false
                 switch phase {
-                case "began": actions = directTouch.began(id: id, point: point)
-                case "moved": actions = directTouch.moved(id: id, point: point)
-                case "ended": actions = directTouch.ended(id: id, point: point)
-                case "cancelled": actions = directTouch.cancel(id: id)
+                case "began":
+                    fingerMomentum.begin(id: id, point: point, timestamp: touch.timestamp)
+                    actions = directTouch.began(id: id, point: point)
+                case "moved":
+                    // Actual coalesced samples improve release velocity;
+                    // predicted samples could invent a fling after lift-off.
+                    for sample in event?.samples(for: touch) ?? [touch] {
+                        fingerMomentum.sample(id: id, point: sample.location(in: self),
+                                              timestamp: sample.timestamp)
+                    }
+                    fingerMomentum.sample(id: id, point: point, timestamp: touch.timestamp)
+                    actions = directTouch.moved(id: id, point: point)
+                case "ended":
+                    let wasScrolling = directTouch.isScrolling
+                    actions = directTouch.ended(id: id, point: point)
+                    let completedScroll = wasScrolling || actions.contains {
+                        if case .beginScroll = $0 { return true }
+                        return false
+                    }
+                    shouldStartMomentum = fingerMomentum.end(id: id, point: point,
+                        timestamp: touch.timestamp, allowMomentum: completedScroll)
+                case "cancelled":
+                    stopFingerMomentum()
+                    actions = directTouch.cancel(id: id)
                 default: actions = []
                 }
-                for action in actions { emitDirectTouch(action) }
+                for action in actions {
+                    if case .click = action, suppressMomentumBrakeTap { continue }
+                    emitDirectTouch(action)
+                }
+                if phase == "ended" || phase == "cancelled" { suppressMomentumBrakeTap = false }
+                if shouldStartMomentum { startFingerMomentum() }
             }
+        }
+
+        private func startFingerMomentum() {
+            guard fingerMomentum.isActive, remoteInputEnabled, receiver?.connected == true,
+                  UIApplication.shared.applicationState == .active, window?.isKeyWindow == true,
+                  let video = receiver?.videoSize, video != .zero else {
+                stopFingerMomentum()
+                return
+            }
+            momentumDisplayLink?.invalidate()
+            momentumRemainder = .zero
+            momentumViewport = bounds.size
+            momentumVideoSize = video
+            momentumLastFrame = CACurrentMediaTime()
+            let link = CADisplayLink(target: MomentumTickTarget(view: self),
+                                     selector: #selector(MomentumTickTarget.tick(_:)))
+            link.preferredFramesPerSecond = 60
+            momentumDisplayLink = link
+            link.add(to: .main, forMode: .common)
+            Log.info("Direct finger momentum began")
+        }
+
+        private func advanceFingerMomentum() {
+            guard remoteInputEnabled, receiver?.connected == true,
+                  UIApplication.shared.applicationState == .active, window?.isKeyWindow == true,
+                  !inputEngine.hasActivePen, !twoFingerActive,
+                  bounds.size == momentumViewport, receiver?.videoSize == momentumVideoSize else {
+                stopFingerMomentum()
+                return
+            }
+            let now = CACurrentMediaTime()
+            let delta = fingerMomentum.step(deltaTime: now - momentumLastFrame)
+            momentumLastFrame = now
+            momentumRemainder.x += delta.x
+            momentumRemainder.y += delta.y
+            // Accumulate sub-point tails rather than losing every small frame
+            // to the Mac wheel's integer rounding. Keep the target anchored.
+            let whole = CGPoint(x: momentumRemainder.x.rounded(.towardZero),
+                                y: momentumRemainder.y.rounded(.towardZero))
+            momentumRemainder.x -= whole.x
+            momentumRemainder.y -= whole.y
+            if whole != .zero { emitDirectTouch(.scroll(delta: whole)) }
+            // step may return a final delta while simultaneously becoming idle.
+            if !fingerMomentum.isActive { stopFingerMomentum() }
+        }
+
+        private func stopFingerMomentum() {
+            let wasRunning = momentumDisplayLink != nil
+            momentumDisplayLink?.invalidate()
+            momentumDisplayLink = nil
+            fingerMomentum.cancel()
+            momentumRemainder = .zero
+            if wasRunning { Log.info("Direct finger momentum stopped") }
         }
 
         private func emitDirectTouch(_ action: DirectTouchState.Action) {
@@ -1147,6 +1273,7 @@ struct VideoLayerView: UIViewRepresentable {
             let usePencilWire = receiver?.macSupportsPencilWire ?? false
 
             if !pencil.isEmpty {
+                stopFingerMomentum()
                 // A resting palm must never become a delayed tap after pen-up.
                 directTouch.reset()
                 if usePencilWire {
@@ -1165,6 +1292,13 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let wasDecelerating = fingerMomentum.isActive
+            stopFingerMomentum()
+            if touches.contains(where: { $0.type == .direct }) {
+                // Touching a moving page stops it without accidentally opening
+                // the link/button under that braking tap. A new swipe still works.
+                suppressMomentumBrakeTap = wasDecelerating
+            }
             focusRemoteInput()
             pencilContactsBegan(touches)
             routeTouches("began", touches, event, ended: false)
@@ -1178,6 +1312,7 @@ struct VideoLayerView: UIViewRepresentable {
             pencilContactsEnded(touches, cancelled: false)
         }
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            stopFingerMomentum()
             routeTouches("cancelled", touches, event, ended: true)
             pencilContactsEnded(touches, cancelled: true)
         }
