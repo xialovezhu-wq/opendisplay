@@ -130,3 +130,16 @@ cannot cause a large catch-up jump.
 
 Run `sh tools/tests/finger-scroll-momentum/run.sh` for the momentum checks;
 `sh tools/tests/direct-touch-state/run.sh` verifies tap/scroll separation.
+
+### Device acceptance — 2026-10-22
+
+The paired iPad is running build 185, confirmed by device readback. The user
+verified all three momentum checks on the device:
+
+- A fast swipe continues after release and gradually stops.
+- Touching the moving page stops it without activating the item underneath.
+- Moving slowly, pausing, and then releasing does not leave residual motion.
+
+These observations supplement the 28 momentum, 56 direct-touch, and 78
+keyboard/Pencil state checks. This acceptance update changes documentation
+only; the verified app remains build 185.
