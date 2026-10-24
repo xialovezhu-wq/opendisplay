@@ -8,7 +8,11 @@ It is a personal development variant, not an official OpenDisplay release.
 See [local build and behavior notes](LOCAL_INPUT_BUILD.md) and
 [iPad input details](iOS/REMOTE_INPUT.md). Signing credentials, device identifiers,
 installed applications, and machine-specific renewal configuration are not stored
-in this repository. The original upstream overview follows.
+in this repository.
+
+中文配置说明：[妙控键盘、USB 与通用控制](LOCAL_INPUT_SETUP.zh-CN.md)。
+
+The original upstream overview follows.
 
 <div align="center">
 
