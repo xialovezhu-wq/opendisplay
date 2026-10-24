@@ -51,6 +51,13 @@ Developer Mode. Debug uses receiver port 9001 (the official app uses 9000), so
 the two iPad listeners cannot collide. Run one display pair at a time to avoid
 creating an unnecessary second virtual display.
 
+For this USB setup, also avoid an active Universal Control keyboard/mouse link
+to the same iPad. Automatic edge connection and automatic reconnection are
+separate macOS Display settings; either can reintroduce a competing native input
+path. The local repair disconnects that iPad's native link and disables both
+automatic options, while leaving manual Universal Control available. See the
+device follow-up in `iOS/REMOTE_INPUT.md` for the evidence and validation limits.
+
 ## Verification
 
 Automated checks cover physical HID mapping and modifier state, repeated keys,

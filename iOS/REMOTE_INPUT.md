@@ -165,3 +165,27 @@ Validation: 20 focus recovery checks and the existing 78 input-state checks
 pass. Signed device installation is recorded in the local delivery receipt.
 Direct typing without a preliminary click still
 requires device observation; it must not be inferred from compilation alone.
+
+### Device follow-up: Universal Control conflict
+
+The user confirmed that build 186 did not fix the long-idle symptom. Successful
+first-responder acquisition alone was not an end-to-end acceptance result.
+Mac system logs later showed Universal Control moving keyboard ownership to
+the paired iPad; a local button click moved it back to the Mac and cleared
+input filtering. This occurred during the reported recurrence at 16:06 on
+2026-10-24.
+
+The native keyboard/mouse link for that iPad was disconnected in macOS Display
+settings, and automatic edge connection plus automatic reconnection were turned
+off. The USB OpenDisplay virtual display remained connected. The first key test
+after disconnection still failed, so the iPad OpenDisplay app was relaunched to
+establish a fresh input session. At 16:25 the user confirmed that the Globe key
+worked immediately without a preliminary trackpad click. Both devices logged
+the matching down/up events, after automatic focus acquisition and with USB
+transport. Long-idle behavior after this configuration repair has not yet been
+separately verified.
+
+This is a host configuration repair, not another keyboard-protocol change.
+When troubleshooting a recurrence, inspect Universal Control keyboard ownership
+and connection state alongside UIKit focus; do not assume all failures are
+first-responder failures or silently re-enable the competing automatic link.
