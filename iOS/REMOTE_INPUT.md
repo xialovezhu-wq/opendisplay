@@ -143,3 +143,25 @@ verified all three momentum checks on the device:
 These observations supplement the 28 momentum, 56 direct-touch, and 78
 keyboard/Pencil state checks. This acceptance update changes documentation
 only; the verified app remains build 185.
+
+## Keyboard focus recovery — 2026-10-24
+
+The user reported that typing on the iPad Magic Keyboard only started working
+after a trackpad click. The previous view requested first-responder status
+synchronously during view/connection updates, ignored a failed request, and
+only had an explicit retry when a touch began. The source gap matches the
+report; the earlier logs did not distinguish the state before that click.
+
+The repair schedules focus after UIKit's current transition, combines duplicate
+requests, and bounds retries. Active-scene, key-window, keyboard-connection and
+settings-dismissal events can begin a new recovery attempt. Disabled input,
+background, disconnect and view teardown invalidate old callbacks. A local
+text editor or presented sheet keeps focus until its actual dismissal. HID
+forwarding still uses UIKit presses and the Mac input method; recovery does not
+synthesize a click or choose a Mac target window. Focus diagnostics contain
+state and recovery source, never ordinary key values or typed text.
+
+Validation: 20 focus recovery checks and the existing 78 input-state checks
+pass. Signed device installation is recorded in the local delivery receipt.
+Direct typing without a preliminary click still
+requires device observation; it must not be inferred from compilation alone.

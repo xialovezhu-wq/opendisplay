@@ -42,6 +42,7 @@ struct ReceiverScreen: View {
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
+    @State private var inputFocusRevision = 0
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -78,7 +79,8 @@ struct ReceiverScreen: View {
                                    useMetal: metalRenderer,
                                    remoteInputEnabled: scenePhase == .active && !showSettings
                                        && !showOnboarding && requiredUpdate == nil
-                                       && recommendedUpdate == nil)
+                                       && recommendedUpdate == nil,
+                                   inputFocusRevision: inputFocusRevision)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
                     if let message = model.receiver.inputActionFeedback {
@@ -111,14 +113,14 @@ struct ReceiverScreen: View {
             .onChange(of: geo.size) { size in
                 model.receiver.setOrientation(portrait: size.height > size.width)
             }
-            .sheet(isPresented: $showOnboarding) {
+            .sheet(isPresented: $showOnboarding, onDismiss: { inputFocusRevision += 1 }) {
                 OnboardingView { onboardingDismissed = true }
             }
         }
         .ignoresSafeArea(edges: isStreaming ? .all : [])
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
-        .sheet(isPresented: $showSettings) {
+        .sheet(isPresented: $showSettings, onDismiss: { inputFocusRevision += 1 }) {
             SettingsView(receiver: model.receiver)
         }
         // Below the force floor → blocking gate. Setter is a no-op: the user
@@ -724,6 +726,7 @@ struct VideoLayerView: UIViewRepresentable {
     let receiver: StreamReceiver
     let useMetal: Bool
     let remoteInputEnabled: Bool
+    let inputFocusRevision: Int
 
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
@@ -731,6 +734,7 @@ struct VideoLayerView: UIViewRepresentable {
         view.isMultipleTouchEnabled = true
         view.receiver = receiver
         view.remoteInputEnabled = remoteInputEnabled
+        view.inputFocusRevision = inputFocusRevision
 
         Log.info("video view: metal=\(useMetal)")
         if useMetal, let renderer = MetalVideoRenderer() {
@@ -790,6 +794,10 @@ struct VideoLayerView: UIViewRepresentable {
     func updateUIView(_ uiView: VideoView, context: Context) {
         uiView.remoteInputEnabled = remoteInputEnabled
         uiView.synchronizeRemoteInput()
+        if uiView.inputFocusRevision != inputFocusRevision {
+            uiView.inputFocusRevision = inputFocusRevision
+            uiView.localPresentationDidDismiss()
+        }
         // videoSize arrives after the format description — re-fit the layers.
         uiView.setNeedsLayout()
     }
@@ -801,6 +809,7 @@ struct VideoLayerView: UIViewRepresentable {
     }
 
     final class VideoView: RemoteInputView {
+        var inputFocusRevision = 0
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
         private var directTouch = DirectTouchState()

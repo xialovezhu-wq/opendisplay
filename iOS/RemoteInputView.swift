@@ -1,4 +1,5 @@
 import UIKit
+import GameController
 
 /// First-responder input for the existing video view. It has no text-input
 /// traits or hidden text field, so UIKit cannot also send composed characters.
@@ -10,9 +11,12 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
     private var pencilActions = DeferredPencilActions<PencilToolAction>()
     private var keyboardAvailable = false
     private var pencilAvailable = false
-    private var applicationActive = UIApplication.shared.applicationState == .active
+    private var lifecycleSuspended = false
     private var repeatTimer: Timer?
     private var observers: [NSObjectProtocol] = []
+    private var focusRecovery = RemoteInputFocusRecovery()
+    private var focusWork: DispatchWorkItem?
+    private var didLogFirstKeyboardEvent = false
     private lazy var pencilInteraction: UIPencilInteraction = {
         let interaction = UIPencilInteraction()
         interaction.delegate = self
@@ -26,18 +30,35 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.willResignActiveNotification,
                                             object: nil, queue: .main) { [weak self] _ in
-            self?.applicationActive = false
+            self?.lifecycleSuspended = true
             self?.synchronizeRemoteInput()
         })
         observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
                                             object: nil, queue: .main) { [weak self] _ in
-            self?.applicationActive = true
+            self?.lifecycleSuspended = false
             self?.synchronizeRemoteInput()
+            self?.requestFocusRecovery(reason: "app-active")
+        })
+        observers.append(center.addObserver(forName: UIScene.willDeactivateNotification,
+                                            object: nil, queue: .main) { [weak self] notification in
+            guard let self, let scene = notification.object as? UIScene,
+                  scene === self.window?.windowScene else { return }
+            self.lifecycleSuspended = true
+            self.synchronizeRemoteInput()
+        })
+        observers.append(center.addObserver(forName: UIScene.didActivateNotification,
+                                            object: nil, queue: .main) { [weak self] notification in
+            guard let self, let scene = notification.object as? UIScene,
+                  scene === self.window?.windowScene else { return }
+            self.lifecycleSuspended = false
+            self.synchronizeRemoteInput()
+            self.requestFocusRecovery(reason: "scene-active")
         })
         observers.append(center.addObserver(forName: UIWindow.didResignKeyNotification,
                                             object: nil, queue: .main) { [weak self] notification in
             guard let self, let window = notification.object as? UIWindow,
                   window === self.window else { return }
+            self.cancelFocusRecovery(reason: "window-resigned-key")
             self.releaseRemoteInput()
             self.synchronizeRemoteInput()
         })
@@ -46,6 +67,12 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
             guard let self, let window = notification.object as? UIWindow,
                   window === self.window else { return }
             self.synchronizeRemoteInput()
+            self.requestFocusRecovery(reason: "window-key")
+        })
+        observers.append(center.addObserver(forName: .GCKeyboardDidConnect,
+                                            object: nil, queue: .main) { [weak self] _ in
+            self?.synchronizeRemoteInput()
+            self?.requestFocusRecovery(reason: "keyboard-connected")
         })
     }
 
@@ -53,6 +80,7 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
 
     deinit {
         repeatTimer?.invalidate()
+        focusWork?.cancel()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 
@@ -60,26 +88,36 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        if window?.windowScene?.activationState == .foregroundActive { lifecycleSuspended = false }
         synchronizeRemoteInput()
+        requestFocusRecovery(reason: "view-attached")
     }
 
     override func willMove(toWindow newWindow: UIWindow?) {
-        if newWindow == nil { releaseRemoteInput() }
+        if newWindow !== window {
+            cancelFocusRecovery(reason: "view-moving")
+            releaseRemoteInput()
+        }
         super.willMove(toWindow: newWindow)
     }
 
     override func resignFirstResponder() -> Bool {
         let didResign = super.resignFirstResponder()
-        if didResign { releaseRemoteInput() }
+        if didResign {
+            releaseRemoteInput()
+            // UIKit may still be assigning the new responder. Inspect local
+            // editors only on the queued turn, never steal focus synchronously.
+            requestFocusRecovery(reason: "resigned")
+        }
         return didResign
     }
 
     /// Called on capability, connection, scene, and presentation changes.
     func synchronizeRemoteInput() {
-        let active = remoteInputEnabled && applicationActive && window?.isKeyWindow == true
-            && receiver?.connected == true
+        let active = isRemoteInputEligible
         let nextKeyboard = active && receiver?.supportsKeyboardInput == true
         let nextPencil = active && receiver?.supportsPencilToolInput == true
+        let becameEligible = nextKeyboard && !keyboardAvailable || nextPencil && !pencilAvailable
         if keyboardAvailable && !nextKeyboard || pencilAvailable && !nextPencil {
             releaseRemoteInput()
         }
@@ -87,15 +125,101 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
         pencilAvailable = nextPencil
         pencilInteraction.isEnabled = nextPencil
         if nextKeyboard || nextPencil {
-            if !isFirstResponder { becomeFirstResponder() }
+            // Network/performance updates must not replenish an exhausted
+            // budget. Only a false-to-true eligibility edge starts one here.
+            if becameEligible { requestFocusRecovery(reason: "eligible") }
         } else if isFirstResponder {
+            cancelFocusRecovery(reason: "disabled")
             resignFirstResponder()
+        } else {
+            cancelFocusRecovery(reason: "disabled")
         }
+    }
+
+    private var isRemoteInputEligible: Bool {
+        remoteInputEnabled && !lifecycleSuspended && window?.isKeyWindow == true
+            && window?.windowScene?.activationState == .foregroundActive
+            && receiver?.connected == true
+    }
+
+    /// SwiftUI calls this after an actual local-sheet dismissal, not merely
+    /// when its binding changes before UIKit finishes dismissing its editor.
+    func localPresentationDidDismiss() {
+        synchronizeRemoteInput()
+        requestFocusRecovery(reason: "local-dismissed")
+    }
+
+    private func requestFocusRecovery(reason: String) {
+        guard isRemoteInputEligible,
+              receiver?.supportsKeyboardInput == true || receiver?.supportsPencilToolInput == true,
+              let attempt = focusRecovery.request() else { return }
+        enqueueFocusAttempt(attempt, reason: reason)
+    }
+
+    private func enqueueFocusAttempt(_ attempt: RemoteInputFocusRecovery.Attempt, reason: String) {
+        focusWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.restoreFocus(attempt, reason: reason) }
+        focusWork = work
+        // Even attempt zero is asynchronous, after UIKit/SwiftUI hierarchy
+        // and responder changes finish on the current main-queue turn.
+        DispatchQueue.main.asyncAfter(deadline: .now() + attempt.delay, execute: work)
+    }
+
+    private func restoreFocus(_ attempt: RemoteInputFocusRecovery.Attempt, reason: String) {
+        guard focusRecovery.isCurrent(attempt) else { return }
+        focusWork = nil
+        let eligible = isRemoteInputEligible
+            && (receiver?.supportsKeyboardInput == true || receiver?.supportsPencilToolInput == true)
+        let blocked = eligible && isLocalUIUsingFocus
+        let preparation = focusRecovery.prepare(attempt, eligible: eligible,
+                                                blockedByLocalUI: blocked, focused: isFirstResponder)
+        let source = reason == "touch" ? "touch" : "automatic/\(reason)"
+        switch preparation {
+        case .acquire:
+            // Recompute capability flags immediately before UIKit reads
+            // canBecomeFirstResponder, rather than trusting an old snapshot.
+            keyboardAvailable = receiver?.supportsKeyboardInput == true
+            pencilAvailable = receiver?.supportsPencilToolInput == true
+            let acquired = becomeFirstResponder() && isFirstResponder
+            Log.info("Input focus: source=\(source) attempt=\(attempt.index + 1) success=\(acquired)")
+            if acquired { didLogFirstKeyboardEvent = false }
+            if let next = focusRecovery.complete(attempt, succeeded: acquired) {
+                enqueueFocusAttempt(next, reason: reason)
+            }
+        case .alreadyFocused:
+            Log.info("Input focus: source=\(source) already-focused=true")
+        case .blockedByLocalUI:
+            Log.info("Input focus: source=\(source) blocked=local-editor-or-modal")
+        case .disabled:
+            Log.info("Input focus: source=\(source) cancelled=inactive-or-disconnected")
+        case .stale:
+            break
+        }
+    }
+
+    private var isLocalUIUsingFocus: Bool {
+        guard let window else { return false }
+        if window.rootViewController?.presentedViewController != nil { return true }
+        func editingResponder(in view: UIView) -> Bool {
+            if view !== self && view.isFirstResponder && (view is UITextInput || view is UIKeyInput) {
+                return true
+            }
+            return view.subviews.contains(where: editingResponder)
+        }
+        return editingResponder(in: window)
+    }
+
+    private func cancelFocusRecovery(reason: String) {
+        if focusRecovery.pending != nil { Log.info("Input focus: cancelled=\(reason)") }
+        focusWork?.cancel()
+        focusWork = nil
+        focusRecovery.invalidate()
     }
 
     /// Cancels queued gestures and always resets the peer while this view
     /// owns a negotiated input session, even if no local key remains down.
     func releaseRemoteInput() {
+        didLogFirstKeyboardEvent = false
         repeatTimer?.invalidate()
         repeatTimer = nil
         for event in keyboard.reset() { send(event) }
@@ -111,7 +235,7 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
     func remoteInputWillReset() {}
 
     func focusRemoteInput() {
-        if (keyboardAvailable || pencilAvailable) && !isFirstResponder { becomeFirstResponder() }
+        if !isFirstResponder { requestFocusRecovery(reason: "touch") }
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -119,6 +243,10 @@ class RemoteInputView: UIView, UIPencilInteractionDelegate {
         guard keyboardAvailable, isFirstResponder else {
             super.pressesBegan(presses, with: event)
             return
+        }
+        if !didLogFirstKeyboardEvent, presses.contains(where: { $0.key != nil }) {
+            Log.info("Keyboard first event after focus: count=\(presses.count)")
+            didLogFirstKeyboardEvent = true
         }
         var unhandled: Set<UIPress> = []
         let ordered = presses.sorted {
